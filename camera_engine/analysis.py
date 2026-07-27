@@ -1,9 +1,22 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import cv2
 import numpy as np
+
+# Extensions OpenCV cannot reliably decode (raw sensor formats). For these we
+# pull the camera's own embedded JPEG preview via rawpy/libraw instead of
+# handing raw bytes to cv2.imdecode -- CR2/CR3 etc. are TIFF-based containers
+# and OpenCV's TIFF codec chokes on the legacy JPEG compression Canon uses
+# for the embedded preview (see analyze_saved_file docstring below).
+RAW_EXTENSIONS = {".cr2", ".cr3", ".nef", ".arw", ".dng", ".raf", ".orf", ".rw2", ".pef", ".srw"}
+
+try:
+    import rawpy
+except ImportError:  # pragma: no cover - exercised only if rawpy isn't installed
+    rawpy = None
 
 
 @dataclass(slots=True)
@@ -64,6 +77,63 @@ def sharpness_of(gray: np.ndarray) -> float:
     if gray.size == 0:
         return 0.0
     return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def extract_raw_preview_bytes(path: Path) -> bytes | None:
+    """Pull the embedded JPEG preview out of a camera raw file (CR2/CR3/NEF/...)
+    via rawpy/libraw. Returns None (never raises) if rawpy isn't installed, the
+    file has no usable embedded preview, or extraction fails for any reason --
+    callers should treat None as "no sharpness data available for this frame"
+    rather than crashing or falling back to feeding raw bytes into cv2.
+    """
+    if rawpy is None:
+        return None
+    try:
+        with rawpy.imread(str(path)) as raw:
+            thumb = raw.extract_thumb()
+    except Exception:
+        return None
+    if thumb.format == rawpy.ThumbFormat.JPEG:
+        return thumb.data
+    if thumb.format == rawpy.ThumbFormat.BITMAP:
+        # thumb.data is an RGB numpy array here; re-encode as JPEG in-memory
+        # so downstream code (which all works on bytes) doesn't need a second path.
+        try:
+            bgr = cv2.cvtColor(thumb.data, cv2.COLOR_RGB2BGR)
+            ok, encoded = cv2.imencode(".jpg", bgr)
+            if ok:
+                return encoded.tobytes()
+        except Exception:
+            return None
+    return None
+
+
+def analyze_saved_file(
+    path: Path,
+    *,
+    roi: tuple[float, float, float, float] | None = None,
+    max_side: int | None = 1280,
+) -> ImageAnalysis | None:
+    """Analyze sharpness/edge data for a just-captured file on disk, whatever
+    its format. JPEGs go straight through OpenCV; known raw extensions go
+    through rawpy's embedded-preview extraction first. Returns None (never
+    raises) when no analyzable image data could be obtained -- e.g. a
+    RAW-only capture on a system without rawpy installed -- so callers can
+    report "no sharpness data" instead of silently showing a misleading 0.0.
+    """
+    suffix = path.suffix.lower()
+    if suffix in RAW_EXTENSIONS:
+        preview_bytes = extract_raw_preview_bytes(path)
+        if preview_bytes is None:
+            return None
+        try:
+            return analyze_image_bytes(preview_bytes, roi=roi, max_side=max_side)
+        except ValueError:
+            return None
+    try:
+        return analyze_image_bytes(path.read_bytes(), roi=roi, max_side=max_side)
+    except ValueError:
+        return None
 
 
 def analyze_image_bytes(

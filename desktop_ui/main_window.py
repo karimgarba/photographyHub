@@ -100,8 +100,13 @@ class MainWindow(QMainWindow):
         self.cmd_clear_path.connect(self.worker.clear_focus_path)
         self.cmd_replay_path.connect(self.worker.replay_focus_path)
         self.cmd_set_capture_options.connect(self.worker.set_capture_options)
-        self.cmd_cancel.connect(self.worker.request_cancel)
-        self.cmd_resolve_plan.connect(self.worker.resolve_stack_plan)
+        # DirectConnection is required here: while a stack is running, the worker
+        # thread is blocked inside _await_plan()'s busy-wait, so its Qt event loop
+        # never processes queued cross-thread calls. request_cancel/resolve_stack_plan
+        # only touch a threading.Event + plain bools, which are safe to hit directly
+        # from the UI thread without marshaling through the worker's event loop.
+        self.cmd_cancel.connect(self.worker.request_cancel, Qt.ConnectionType.DirectConnection)
+        self.cmd_resolve_plan.connect(self.worker.resolve_stack_plan, Qt.ConnectionType.DirectConnection)
 
         self.worker.log.connect(self._log)
         self.worker.connected.connect(self._on_connected)

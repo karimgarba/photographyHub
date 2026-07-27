@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from time import sleep, time
 
-from camera_engine.analysis import analyze_image_bytes, preview_frame_delta
+from camera_engine.analysis import analyze_image_bytes, analyze_saved_file, preview_frame_delta
 from camera_engine.camera import GPhoto2Camera
 from camera_engine.dof import drive_unit_for_step_mm, recommended_step_mm, smooth_focus_path
 from camera_engine.stacking import (
@@ -163,7 +163,7 @@ class FocusStackController:
         edge = 0.0
         extras = list(getattr(capture, "extra_paths", []) or [])
         if capture.success and capture.saved_path is not None:
-            # Prefer JPEG among primary+extras for sharpness readout
+            # Prefer JPEG among primary+extras for sharpness readout (fastest path)
             candidates = [capture.saved_path, *extras]
             for path in candidates:
                 if path.suffix.lower() in {".jpg", ".jpeg"}:
@@ -175,14 +175,16 @@ class FocusStackController:
                     except Exception:
                         continue
             if sharpness == 0.0:
+                # No JPEG companion (e.g. RAW-only capture): analyze_saved_file
+                # extracts the embedded preview via rawpy for raw extensions
+                # instead of handing raw bytes to cv2.imdecode, which cannot
+                # decode them and previously logged spurious TIFF errors while
+                # silently leaving sharpness/edge_density at 0.0 for every frame.
                 try:
-                    analysis = analyze_image_bytes(
-                        capture.saved_path.read_bytes(),
-                        roi=roi,
-                        max_side=1280,
-                    )
-                    sharpness = analysis.sharpness
-                    edge = analysis.edge_density
+                    analysis = analyze_saved_file(capture.saved_path, roi=roi, max_side=1280)
+                    if analysis is not None:
+                        sharpness = analysis.sharpness
+                        edge = analysis.edge_density
                 except Exception:
                     pass
         return capture.success, capture.saved_path, capture.stderr, sharpness, edge, extras
@@ -228,14 +230,19 @@ class FocusStackController:
         opts = options or CaptureOptions()
         plan = self.build_preset_plan(start_position, end_position, preset)
         session = self.build_session(plan, output_dir)
-        session.capture_offsets = list(plan.focus_positions)
+        unit = _unit_step(preset)
+        direction = 1 if end_position >= start_position else -1
+        # These are the positions actually driven below (start + i*direction*unit),
+        # not plan.focus_positions' evenly-spaced/rounded values -- the two only
+        # match when (end - start) is an exact multiple of the preset's unit size.
+        session.capture_offsets = [
+            start_position + index * direction * unit for index in range(plan.step_count)
+        ]
         output_dir.mkdir(parents=True, exist_ok=True)
         locked = self._prepare_capture(opts)
         if on_coverage:
             on_coverage({}, list(session.capture_offsets))
 
-        unit = _unit_step(preset)
-        direction = 1 if end_position >= start_position else -1
         total = len(session.steps)
         stamp = int(time())
 
