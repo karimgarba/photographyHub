@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "photographyhub"
+version = "0.1.0"
+description = "Cross-platform DSLR focus stacking helper"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+  "PySide6>=6.8",
+  "gphoto2>=2.6.4",
+  "numpy>=2.0",
+  "opencv-python>=4.10",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.setuptools]
+package-dir = {"" = "."}
+
+[tool.setuptools.packages.find]
+include = ["camera_engine*", "desktop_ui*"]
+
+[project.scripts]
+photographyhub = "desktop_ui.app:main"
