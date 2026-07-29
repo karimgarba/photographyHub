@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from time import sleep
 
 from camera_engine.analysis import analyze_image_bytes
 from camera_engine.camera import GPhoto2Camera
@@ -30,9 +31,41 @@ _AF_DRIVE_VALUES = (
     "Drive Lens",
 )
 
+# Live View contrast-detect AF on bodies like the 4000D runs asynchronously on
+# the camera and isn't done the instant gPhoto2 accepts the "Press Half"
+# command -- it commonly takes several hundred ms to over a second. Without
+# this settle + verification step, the code used to report "AF ok" the
+# instant the PTP command was accepted, well before the lens had actually
+# finished (or sometimes even started) racking -- so a follow-up Box AF click
+# would interrupt the in-flight hunt and restart it, producing an endless
+# refocus loop that never converges.
+_AF_SETTLE_SECONDS = 0.9
+_AF_MIN_RETAINED_SHARPNESS = 0.95  # allow up to 5% drop before treating AF as failed
 
-def try_camera_autofocus(camera: GPhoto2Camera, roi: tuple[float, float, float, float] | None) -> AutofocusResult | None:
-    """Attempt native camera AF drive. Returns None if nothing actually drove."""
+
+def _measure_sharpness(camera: GPhoto2Camera, roi: tuple[float, float, float, float] | None) -> float:
+    try:
+        preview = camera.capture_preview()
+    except Exception:
+        return -1.0
+    if not preview.success or preview.preview_data is None:
+        return -1.0
+    try:
+        return analyze_image_bytes(preview.preview_data, roi=roi, max_side=320).sharpness
+    except Exception:
+        return -1.0
+
+
+def try_camera_autofocus(
+    camera: GPhoto2Camera,
+    roi: tuple[float, float, float, float] | None,
+    *,
+    settle_seconds: float = _AF_SETTLE_SECONDS,
+) -> AutofocusResult | None:
+    """Attempt native camera AF drive. Returns None if nothing actually drove,
+    or if the drive was accepted but couldn't be confirmed to have actually
+    focused -- callers should fall back to software_contrast_hunt in that case
+    rather than trust a false 'success'."""
     if roi is not None:
         cx = roi[0] + roi[2] / 2.0
         cy = roi[1] + roi[3] / 2.0
@@ -42,15 +75,32 @@ def try_camera_autofocus(camera: GPhoto2Camera, roi: tuple[float, float, float, 
                 if positioned.success:
                     break
 
+    before = _measure_sharpness(camera, roi)
+
     for names in (("autofocusdrive",), ("eosremoterelease",)):
         for value in _AF_DRIVE_VALUES:
             result = camera.set_widget_choice(names, value)
-            if result.success:
+            if not result.success:
+                continue
+
+            sleep(settle_seconds)
+            after = _measure_sharpness(camera, roi)
+            if names[0] == "eosremoterelease" and value == "Press Half":
+                # Always close the half-press cycle explicitly, or the camera
+                # can be left in an ambiguous "half-pressed" state that
+                # interferes with the next AF/shoot command.
+                camera.set_widget_choice(names, "Release Half")
+
+            if before < 0 or after < 0 or after >= before * _AF_MIN_RETAINED_SHARPNESS:
                 return AutofocusResult(
                     success=True,
                     method="camera-drive",
                     message=f"Camera AF drive via {names[0]}={value}",
                 )
+            # Sharpness dropped meaningfully after settling -- AF likely
+            # hunted and didn't lock. Let the caller fall back to
+            # software_contrast_hunt instead of reporting a false success.
+            return None
     return None
 
 

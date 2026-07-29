@@ -104,7 +104,51 @@ equal `[0, 3, 6, 9]` for the 0→10/Large example above.
 
 ---
 
-## 4. Plan-generation logic — design review (not changed, flagging for awareness)
+## 4. FIXED — AF "just loops / racking forever, never focuses"
+
+**Symptom:** Box AF appears to "succeed" almost instantly and repeatedly,
+but the lens keeps racking focus (and live view visibly hunts/"zooms") and
+never actually settles — matches the earlier log's ~12 back-to-back
+"Box AF… / AF ok — camera-drive" cycles.
+
+**Root cause:** `try_camera_autofocus()` in `autofocus.py` declared
+`success=True` the instant `camera.set_widget_choice(("eosremoterelease",),
+"Press Half")` returned success — but that only means gPhoto2's PTP command
+was *accepted*, not that the camera actually achieved focus. Live View
+contrast-detect AF on a body like the 4000D runs asynchronously and commonly
+takes several hundred ms to over a second to settle. Two consequences:
+
+- The app reported "AF ok" well before the lens had actually finished (or
+  sometimes even started) racking, so clicking Box AF again — reasonably,
+  since the UI said it was done — **interrupted the in-flight AF hunt and
+  restarted it from scratch**, over and over.
+- The code never sent `Release Half` to close the half-press cycle it
+  opened, which can leave the camera in an ambiguous held-half-press state
+  that interferes with the next AF/shoot command.
+
+**Fix:** `try_camera_autofocus()` now, after a drive command is accepted:
+waits a settle period (0.9s, configurable via a new `settle_seconds`
+parameter for testing), re-measures ROI sharpness, and only reports success
+if sharpness held or improved (allowing up to a 5% dip) — otherwise returns
+`None` so the existing fallback to `software_contrast_hunt` (which already
+did this correctly) kicks in. It also now always sends `Release Half` after
+a successful `Press Half` to properly close the cycle. If the preview can't
+be measured (inconclusive), it still trusts the native "success" rather than
+blocking indefinitely.
+
+**Tests:** `tests/test_af_verify_before_success.py` — sharpness holding →
+success; sharpness dropping after settle → falls back (`None`); Press Half
+is always paired with Release Half.
+
+**Trade-off worth knowing:** every native AF attempt now takes ~0.9s longer
+than before (previously near-instant, but that instant response was the bug
+— it was reporting success before the camera had actually focused). This is
+a deliberate correctness-over-speed trade for a body where Live View AF
+genuinely isn't instant.
+
+---
+
+## 5. Plan-generation logic — design review (not changed, flagging for awareness)
 
 The core adaptive-plan pipeline (`plan_adaptive_offsets` → coarse scan both
 directions → `roi_sharpness_bounds` → `fine_fill_offsets` →
@@ -149,9 +193,11 @@ findings from reading the logic closely.
 | `desktop_ui/main_window.py` | Confirm/Cancel connections → `DirectConnection` |
 | `camera_engine/analysis.py` | Added `extract_raw_preview_bytes`, `analyze_saved_file`, `RAW_EXTENSIONS` |
 | `camera_engine/workflow.py` | `_save_capture` uses `analyze_saved_file`; `capture_basic_stack` reports real driven offsets |
+| `camera_engine/autofocus.py` | `try_camera_autofocus` verifies AF actually settled before reporting success; sends `Release Half` |
 | `pyproject.toml` | Added `rawpy>=0.21` dependency |
 | `tests/test_stack_confirm_deadlock.py` | New — deadlock regression test |
 | `tests/test_raw_sharpness_and_offsets.py` | New — RAW-sharpness + offset-reporting regression tests |
+| `tests/test_af_verify_before_success.py` | New — AF verify-before-success regression tests |
 
 **Before running the app again:** install the new dependency —
 ```bash
@@ -162,8 +208,6 @@ or just `.venv/bin/pip install rawpy`.
 ## Test results
 
 ```
-48 passed in 2.95s
+51 passed in 4.79s
 ```
-(43 pre-existing tests unchanged and passing, 5 new for this pass — the 2
-deadlock tests from the previous fix aren't recounted here since they're
-already part of the 48.)
+(43 pre-existing tests unchanged and passing, 8 new across this pass and the previous one.)
