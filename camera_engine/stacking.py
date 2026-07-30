@@ -74,6 +74,7 @@ def roi_sharpness_bounds(
     threshold: float = 0.20,
     fallback_radius: int = 16,
     margin: int = 6,
+    step: int = 1,        
 ) -> tuple[int, int]:
     """
     Contiguous band around the peak where ROI sharpness stays >= peak * threshold,
@@ -91,11 +92,11 @@ def roi_sharpness_bounds(
     floor = peak * threshold
 
     near = peak_offset
-    while near - 1 in curve and curve[near - 1] >= floor:
-        near -= 1
+    while near - step in curve and curve[near - step] >= floor:   # was: near - 1
+        near -= step                                              # was: near -= 1
     far = peak_offset
-    while far + 1 in curve and curve[far + 1] >= floor:
-        far += 1
+    while far + step in curve and curve[far + step] >= floor:     # was: far + 1
+        far += step                                               # was: far += 1
 
     if near == far:
         near = peak_offset - fallback_radius

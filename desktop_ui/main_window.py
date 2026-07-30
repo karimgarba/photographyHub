@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from time import time as _now
+
 from PySide6.QtCore import QMetaObject, QThread, QTimer, QUrl, Qt, Signal
 from PySide6.QtGui import QDesktopServices, QPixmap
 from PySide6.QtWidgets import (
@@ -28,7 +30,14 @@ from PySide6.QtWidgets import (
 
 from camera_engine.analysis import PreviewMetrics
 from camera_engine.camera import CameraInfo, CameraSetting, SETTING_LABELS
-from camera_engine.dof import estimate_dof, estimate_duration_seconds, format_duration, parse_aperture, plan_shot_count
+from camera_engine.dof import (
+    estimate_dof,
+    estimate_duration_seconds,
+    estimate_remaining_seconds,
+    format_duration,
+    parse_aperture,
+    plan_shot_count,
+)
 from camera_engine.stacking import FocusStepPreset, preset_for_step_mm
 from camera_engine.workflow import FocusStackController, merger_command
 from desktop_ui.camera_worker import CameraWorker
@@ -74,6 +83,7 @@ class MainWindow(QMainWindow):
         self._focus_offset = 0
         self._stack_start = 0
         self._stack_end = 40
+        self._stack_started_at = 0.0
         self._updating_slider = False
         self._path_points: list[int] = []
         self._last_stack_paths: list[str] = []
@@ -729,7 +739,14 @@ class MainWindow(QMainWindow):
         self.rail_tabs.setCurrentIndex(1)
         if total > 0:
             self.progress_bar.setValue(int(100 * index / total))
-            remaining = estimate_duration_seconds(max(0, total - index))
+            remaining = estimate_remaining_seconds(
+                max(0, total - index),
+                elapsed_seconds=_now() - self._stack_started_at,
+                shots_done=index,
+                fallback_seconds_per_shot=estimate_duration_seconds(
+                    1, settle_ms=self.settle_spin.value()
+                ),
+            )
             self.progress_label.setText(
                 f"{message}   ·   {format_duration(remaining)} left"
             )
@@ -908,14 +925,18 @@ class MainWindow(QMainWindow):
     def _update_estimates(self) -> None:
         if self.capture_mode.currentText() == "Adaptive":
             shots = self.image_count.value() or 80
-            duration = format_duration(estimate_duration_seconds(shots) + shots * 0.8)
+            duration = format_duration(
+                estimate_duration_seconds(shots, settle_ms=self.settle_spin.value())
+            )
             self.estimate_label.setText(f"Up to {shots}   ·   ~{duration} (scan + capture)")
             return
         preset = FocusStepPreset(self.step_preset.currentText())
         controller = FocusStackController()
         plan = controller.build_preset_plan(self._stack_start, self._stack_end, preset)
         shots = self.image_count.value() or plan.step_count
-        duration = format_duration(estimate_duration_seconds(shots) + shots * 0.8)
+        duration = format_duration(
+            estimate_duration_seconds(shots, settle_ms=self.settle_spin.value())
+        )
         self.estimate_label.setText(f"Shots {shots}   ·   ~{duration}")
 
     def _update_dof(self) -> None:
@@ -956,6 +977,7 @@ class MainWindow(QMainWindow):
         self.confirm_plan_btn.setEnabled(False)
         self.reject_plan_btn.setEnabled(False)
         self.progress_bar.setValue(0)
+        self._stack_started_at = _now()
         adaptive = self.capture_mode.currentText() == "Adaptive"
         max_frames = self.image_count.value() or (80 if adaptive else 40)
         self.cmd_run_stack.emit(

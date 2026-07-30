@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from pathlib import Path
 from threading import Event
 
@@ -322,21 +323,29 @@ class CameraWorker(QObject):
 
     def _drive_to_offset(self, target: int) -> int:
         guard = 0
-        while self._focus_offset != target and guard < 400:
-            if self._cancel:
-                break
-            guard += 1
-            direction = "far" if target > self._focus_offset else "near"
-            size = min(3, abs(target - self._focus_offset))
-            before = self._focus_offset
-            self._drive_focus(direction, size, from_hold=True)
-            if self._focus_offset == before:
-                break
-            if self._limit.endswith("LIMIT") and (
-                (direction == "far" and target > self._focus_offset)
-                or (direction == "near" and target < self._focus_offset)
-            ):
-                break
+        consecutive_failures = 0
+        max_consecutive_failures = 3
+        batch = getattr(self.camera, "batch_config", None)
+        with batch() if callable(batch) else nullcontext():
+            while self._focus_offset != target and guard < 400:
+                if self._cancel:
+                    break
+                guard += 1
+                direction = "far" if target > self._focus_offset else "near"
+                size = min(3, abs(target - self._focus_offset))
+                before = self._focus_offset
+                self._drive_focus(direction, size, from_hold=True)
+                if self._focus_offset == before:
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_consecutive_failures:
+                        break
+                    continue
+                consecutive_failures = 0
+                if self._limit.endswith("LIMIT") and (
+                    (direction == "far" and target > self._focus_offset)
+                    or (direction == "near" and target < self._focus_offset)
+                ):
+                    break
         return self._focus_offset
 
     @Slot(str, int)

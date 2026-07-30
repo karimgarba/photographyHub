@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import sleep, time
@@ -44,6 +45,10 @@ class CaptureOptions:
     scan_stall_patience: int = 5
     scan_min_steps: int = 12
     scan_stall_delta: float = 0.8
+    # Absolute sharpness floor used alongside the relative (peak * 0.12)
+    # one when deciding a frame reads "low". Lower this for low-texture/
+    # low-contrast subjects where real readings sit under the default.
+    stall_floor: float = 3.0
     exposure_lock: bool = True
     flash_recycle_ms: int = 0
     fetch_companions: bool = True
@@ -121,11 +126,17 @@ class FocusStackController:
         return locked
 
     def _settle(self, options: CaptureOptions) -> None:
-        if options.settle_ms > 0:
-            sleep(options.settle_ms / 1000.0)
         if not options.stillness:
+            if options.settle_ms > 0:
+                sleep(options.settle_ms / 1000.0)
             return
-        deadline = time() + options.stillness_timeout_ms / 1000.0
+        # Stillness polling exists precisely to answer "how long do we
+        # actually need to wait" -- don't also pay the full settle_ms as
+        # an unconditional tax in front of it. settle_ms instead sets a
+        # floor on the poll deadline alongside stillness_timeout_ms, so a
+        # slow/cautious settle_ms still bounds the wait without being
+        # paid twice.
+        deadline = time() + max(options.settle_ms, options.stillness_timeout_ms) / 1000.0
         previous: bytes | None = None
         while time() < deadline:
             preview = self.camera.capture_preview()
@@ -188,6 +199,13 @@ class FocusStackController:
                 except Exception:
                     pass
         return capture.success, capture.saved_path, capture.stderr, sharpness, edge, extras
+
+    def _batch_config(self):
+        """self.camera.batch_config() when available, otherwise a no-op --
+        keeps hot loops fast on the real camera while staying compatible
+        with lightweight test doubles that don't implement batching."""
+        batch = getattr(self.camera, "batch_config", None)
+        return batch() if callable(batch) else nullcontext()
 
     def _measure_roi(
         self,
@@ -290,49 +308,53 @@ class FocusStackController:
         stall_delta = max(0.1, options.scan_stall_delta)
         prev_score = curve.get(offset, -1.0)
 
-        for i in range(options.max_scan_steps):
-            if should_cancel and should_cancel():
-                break
-            score = self._measure_roi(options.roi)
-            if score >= 0:
-                curve[offset] = max(curve.get(offset, 0.0), score)
-                if on_scan_sample:
-                    on_scan_sample(dict(curve), offset, score)
-            if on_progress and i % 3 == 0:
-                on_progress(i, options.max_scan_steps, score, f"Scan {direction} @ {offset:+d}")
+        with self._batch_config():
+            for i in range(options.max_scan_steps):
+                if should_cancel and should_cancel():
+                    break
+                score = self._measure_roi(options.roi)
+                if score >= 0:
+                    curve[offset] = max(curve.get(offset, 0.0), score)
+                    if on_scan_sample:
+                        on_scan_sample(dict(curve), offset, score)
+                if on_progress and i % 3 == 0:
+                    scan_total_hint = min(
+                        options.max_scan_steps, max(min_steps, i + patience + 1)
+                    )
+                    on_progress(i, scan_total_hint, score, f"Scan {direction} @ {offset:+d}")
 
-            before = self.camera.capture_preview()
-            before_bytes = before.preview_data if before.success else None
-            drive = self.camera.focus_step(direction, step)
-            if not drive.success:
-                break
-            if bump_offset is not None:
-                bump_offset(direction, step)
-            offset += step if direction == "far" else -step
-            sleep(max(0.12, options.settle_ms / 2500.0) if options.settle_ms else 0.05)
-            after = self.camera.capture_preview()
-            frame_delta = 255.0
-            if after.success and after.preview_data is not None:
-                frame_delta = preview_frame_delta(before_bytes, after.preview_data)
+                before = self.camera.capture_preview()
+                before_bytes = before.preview_data if before.success else None
+                drive = self.camera.focus_step(direction, step)
+                if not drive.success:
+                    break
+                if bump_offset is not None:
+                    bump_offset(direction, step)
+                offset += step if direction == "far" else -step
+                sleep(max(0.12, options.settle_ms / 2500.0) if options.settle_ms else 0.05)
+                after = self.camera.capture_preview()
+                frame_delta = 255.0
+                if after.success and after.preview_data is not None:
+                    frame_delta = preview_frame_delta(before_bytes, after.preview_data)
 
-            after_score = self._measure_roi(options.roi)
-            if after_score >= 0:
-                curve[offset] = max(curve.get(offset, 0.0), after_score)
-                if on_scan_sample:
-                    on_scan_sample(dict(curve), offset, after_score)
-            score_delta = abs(after_score - prev_score) if after_score >= 0 and prev_score >= 0 else 999.0
-            if after_score >= 0:
-                prev_score = after_score
+                after_score = self._measure_roi(options.roi)
+                if after_score >= 0:
+                    curve[offset] = max(curve.get(offset, 0.0), after_score)
+                    if on_scan_sample:
+                        on_scan_sample(dict(curve), offset, after_score)
+                score_delta = abs(after_score - prev_score) if after_score >= 0 and prev_score >= 0 else 999.0
+                if after_score >= 0:
+                    prev_score = after_score
 
-            peak = max(curve.values()) if curve else 0.0
-            low = after_score >= 0 and (peak <= 0 or after_score <= max(3.0, peak * 0.12))
-            if frame_delta < stall_delta and score_delta < 3.0 and low:
-                stalls += 1
-            else:
-                stalls = 0
+                peak = max(curve.values()) if curve else 0.0
+                low = after_score >= 0 and (peak <= 0 or after_score <= max(options.stall_floor, peak * 0.12))
+                if frame_delta < stall_delta and score_delta < 3.0 and low:
+                    stalls += 1
+                else:
+                    stalls = 0
 
-            if i + 1 >= min_steps and stalls >= patience:
-                break
+                if i + 1 >= min_steps and stalls >= patience:
+                    break
         return offset
 
     def plan_adaptive_offsets(
@@ -385,6 +407,7 @@ class FocusStackController:
             curve,
             threshold=opts.peak_threshold,
             margin=opts.bound_margin,
+            step=opts.coarse_step,
         )
         if curve:
             scanned_lo, scanned_hi = min(curve), max(curve)
@@ -408,8 +431,6 @@ class FocusStackController:
         self,
         output_dir: Path,
         max_frames: int,
-        sharpness_gain_threshold: float = 25.0,
-        patience: int = 3,
         *,
         current_offset: int = 0,
         on_progress: ProgressCallback | None = None,

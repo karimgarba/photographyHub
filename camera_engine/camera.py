@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
@@ -134,6 +135,7 @@ class GPhoto2Camera:
         self.context = gp.Context()
         self.camera: gp.Camera | None = None
         self._model_name = ""
+        self._config_cache: gp.CameraWidget | None = None
 
     @staticmethod
     def detect_cameras() -> list[DetectedCamera]:
@@ -221,10 +223,27 @@ class GPhoto2Camera:
         return self.camera
 
     def _get_config(self) -> gp.CameraWidget:
+        if self._config_cache is not None:
+            return self._config_cache
         return self._require_camera().get_config()
 
     def _set_config(self, config: gp.CameraWidget) -> None:
         self._require_camera().set_config(config)
+    
+    @contextmanager
+    def batch_config(self):
+        """Reuse one fetched config tree across a block instead of
+        re-fetching before each call. Writes still happen every time --
+        focus-drive widgets are one-shot actuators; batching writes would
+        collapse several physical moves into one."""
+        owns_batch = self._config_cache is None
+        if owns_batch:
+            self._config_cache = self._require_camera().get_config()
+        try:
+            yield
+        finally:
+            if owns_batch:
+                self._config_cache = None
 
     @staticmethod
     def _find_child_by_names(root: gp.CameraWidget, names: Iterable[str]) -> gp.CameraWidget | None:
