@@ -1,0 +1,14 @@
+gphoto2==2.6.4
+iniconfig==2.3.0
+numpy==2.5.1
+opencv-python==5.0.0.93
+packaging==26.2
+-e git+ssh://git@github.com/karimgarba/photographyHub.git@9d74d3ed8e547d25a02846d6f52b8369808b7899#egg=photographyhub
+pluggy==1.6.0
+Pygments==2.20.0
+PySide6==6.11.1
+PySide6_Addons==6.11.1
+PySide6_Essentials==6.11.1
+pytest==9.1.1
+rawpy==0.27.0
+shiboken6==6.11.1
